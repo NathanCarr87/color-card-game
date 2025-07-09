@@ -1,0 +1,4 @@
+{
+  "name": "P2P Network UNO",
+  "description": "A browser-based UNO game that connects two players on the same network using PeerJS for real-time multiplayer gameplay."
+}
