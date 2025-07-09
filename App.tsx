@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import Peer from 'peerjs';
 import { PlayerHand } from './components/PlayerHand';
 import { GameBoard } from './components/GameBoard';
 import { GameState, Player, Card, Color, Value, GameMode, P2PAction } from './types';
 import * as gameLogic from './services/gameLogic';
 
-// PeerJS is globally available from the script tag in index.html
-declare var Peer: any;
 type DataConnection = any; // Type from PeerJS
 
 const initialPlayers: Player[] = [
@@ -58,7 +57,7 @@ function App() {
     const [gameMode, setGameMode] = useState<GameMode>(GameMode.LOBBY);
     const [myPlayerIndex, setMyPlayerIndex] = useState<number | null>(null);
     
-    const peerRef = useRef<any>(null);
+    const peerRef = useRef<Peer | null>(null);
     const connRef = useRef<DataConnection>(null);
     const [myPeerId, setMyPeerId] = useState<string>('');
     const [remotePeerId, setRemotePeerId] = useState('');
@@ -75,6 +74,94 @@ function App() {
         }
     }, []);
 
+    const applyCardEffects = (
+        state: GameState,
+        playerIndex: number,
+        card: Card,
+        chosenColor?: Color
+    ): GameState => {
+        let players = [...state.players];
+        let deck = [...state.deck];
+        let nextPlayerIndex = (playerIndex + 1) % players.length;
+        let message = '';
+        const cardPlayerName = players[playerIndex]?.name || 'First';
+    
+        switch (card.value) {
+            case Value.DRAW_TWO: {
+                const victimIndex = nextPlayerIndex;
+                for (let i = 0; i < 2; i++) if (deck.length > 0) players[victimIndex].hand.push(deck.pop()!);
+                nextPlayerIndex = (victimIndex + 1) % players.length;
+                message = `${cardPlayerName} played Draw Two. ${players[victimIndex].name} draws 2.`;
+                break;
+            }
+            case Value.WILD_DRAW_FOUR: {
+                const victimIndex = nextPlayerIndex;
+                for (let i = 0; i < 4; i++) if (deck.length > 0) players[victimIndex].hand.push(deck.pop()!);
+                nextPlayerIndex = (victimIndex + 1) % players.length;
+                message = `${cardPlayerName} played W+4 & chose ${chosenColor}. ${players[victimIndex].name} draws 4.`;
+                break;
+            }
+            case Value.SKIP:
+            case Value.REVERSE: // For 2 players, reverse is a skip
+                nextPlayerIndex = (playerIndex + 2) % players.length;
+                message = `${cardPlayerName} played ${card.value}. Turn skipped.`;
+                break;
+            case Value.WILD:
+                 message = `${cardPlayerName} played a Wild and chose ${chosenColor}.`;
+                 break;
+            default:
+                 message = `${cardPlayerName} played a ${card.color} ${card.value}.`;
+        }
+        
+        return {
+            ...state,
+            players,
+            deck,
+            currentColor: chosenColor || card.color,
+            currentPlayerIndex: nextPlayerIndex,
+            gameMessage: message,
+        };
+    };
+    
+    const startNewGame = useCallback(() => {
+        let deck = gameLogic.shuffleDeck(gameLogic.createDeck());
+        const newPlayers = JSON.parse(JSON.stringify(initialPlayers));
+
+        for (let i = 0; i < 7; i++) {
+            newPlayers[0].hand.push(deck.pop()!);
+            newPlayers[1].hand.push(deck.pop()!);
+        }
+
+        let topCard = deck.pop()!;
+        while(topCard.value === Value.WILD_DRAW_FOUR) {
+            deck.push(topCard);
+            deck = gameLogic.shuffleDeck(deck);
+            topCard = deck.pop()!;
+        }
+        
+        const initialState: GameState = {
+            ...INITIAL_STATE,
+            deck,
+            discardPile: [topCard],
+            players: newPlayers,
+            currentColor: topCard.color === Color.WILD ? Color.RED : topCard.color,
+            gameMessage: "Game started! Player 1's turn."
+        };
+        
+        if (topCard.color === Color.WILD) {
+            const tempState = applyCardEffects(initialState, 0, topCard, Color.RED); // Assume red if first card is wild
+            tempState.gameMessage = `Game started. First card was Wild, color is Red. Player 1's turn.`;
+            setGameState(tempState);
+            sendAction({type: 'START_GAME', initialState: tempState, playerIndex: 1 });
+        } else {
+             const tempState = applyCardEffects(initialState, -1, topCard);
+             setGameState(tempState);
+             sendAction({type: 'START_GAME', initialState: tempState, playerIndex: 1 });
+        }
+        setMyPlayerIndex(0);
+
+    }, [sendAction]);
+    
     const handleHostActions = useCallback((action: P2PAction, fromPlayerIndex: number) => {
         setGameState(prev => {
             const topCard = prev.discardPile[prev.discardPile.length - 1];
@@ -96,10 +183,8 @@ function App() {
 
                         if (newHand.length === 0) {
                             newState = { ...tempState, isGameOver: true, winner: player };
-                        } else if (action.card.color === Color.WILD) {
-                             newState = { ...tempState, gameMessage: `${player.name} played a Wild. Waiting for color choice...` };
                         } else {
-                            newState = applyCardEffects(tempState, fromPlayerIndex, action.card);
+                            newState = applyCardEffects(tempState, fromPlayerIndex, action.card, action.chosenColor);
                         }
                     }
                     break;
@@ -117,11 +202,6 @@ function App() {
                     }
                     break;
                 }
-                case 'CHOOSE_COLOR': {
-                     const lastPlayedCard = prev.discardPile[prev.discardPile.length-1];
-                     newState = applyCardEffects(prev, fromPlayerIndex, lastPlayedCard, action.color);
-                     break;
-                }
                 case 'CALL_UNO': {
                     const newUnoCalled = [...prev.unoCalled, prev.players[fromPlayerIndex].id];
                     newState = {...prev, unoCalled: newUnoCalled, gameMessage: `${prev.players[fromPlayerIndex].name} called UNO!`};
@@ -137,54 +217,6 @@ function App() {
         });
     }, [sendAction]);
     
-    const applyCardEffects = (
-        state: GameState,
-        playerIndex: number,
-        card: Card,
-        chosenColor?: Color
-    ): GameState => {
-        let { players, deck } = JSON.parse(JSON.stringify(state));
-        let nextPlayerIndex = (playerIndex + 1) % players.length;
-        let message = '';
-        const cardPlayerName = players[playerIndex].name;
-    
-        switch (card.value) {
-            case Value.DRAW_TWO: {
-                const victimIndex = nextPlayerIndex;
-                for (let i = 0; i < 2; i++) if (deck.length > 0) players[victimIndex].hand.push(deck.pop()!);
-                nextPlayerIndex = (victimIndex + 1) % players.length;
-                message = `${cardPlayerName} played Draw Two. ${players[victimIndex].name} draws 2.`;
-                break;
-            }
-            case Value.WILD_DRAW_FOUR: {
-                const victimIndex = nextPlayerIndex;
-                for (let i = 0; i < 4; i++) if (deck.length > 0) players[victimIndex].hand.push(deck.pop()!);
-                nextPlayerIndex = (victimIndex + 1) % players.length;
-                message = `${cardPlayerName} played W+4 & chose ${chosenColor}. ${players[victimIndex].name} draws 4.`;
-                break;
-            }
-            case Value.SKIP:
-            case Value.REVERSE:
-                nextPlayerIndex = (playerIndex + 2) % players.length;
-                message = `${cardPlayerName} played ${card.value}. Turn skipped.`;
-                break;
-            case Value.WILD:
-                 message = `${cardPlayerName} played a Wild and chose ${chosenColor}.`;
-                 break;
-            default:
-                 message = `${cardPlayerName} played a ${card.color} ${card.value}.`;
-        }
-        
-        return {
-            ...state,
-            players,
-            deck,
-            currentColor: chosenColor || card.color,
-            currentPlayerIndex: nextPlayerIndex,
-            gameMessage: message,
-        };
-    };
-
     const setupConnectionEvents = useCallback((conn: DataConnection) => {
         conn.on('data', (data: P2PAction) => {
             if (isHost) {
@@ -225,62 +257,62 @@ function App() {
             setErrorMsg('Connection lost.');
             setGameMode(GameMode.ERROR);
         });
+        conn.on('error', (err: any) => {
+            setErrorMsg(`Connection Error: ${err.type}`);
+            setGameMode(GameMode.ERROR);
+        });
     }, [isHost, myPlayerIndex, handleHostActions, sendAction, gameState.players]);
     
+    const setupConnectionEventsRef = useRef(setupConnectionEvents);
+    setupConnectionEventsRef.current = setupConnectionEvents;
+
+    const startNewGameRef = useRef(startNewGame);
+    startNewGameRef.current = startNewGame;
+
     useEffect(() => {
-        const peer = new Peer();
+        const peer = new Peer({
+            config: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun2.l.google.com:19302' },
+                ],
+            }
+        });
         peerRef.current = peer;
-        peer.on('open', (id: string) => setMyPeerId(id));
-        peer.on('connection', (conn: DataConnection) => {
-            if (gameMode !== GameMode.HOSTING) {
-                 conn.close();
-                 return;
+
+        peer.on('open', (id) => {
+            setMyPeerId(id);
+        });
+
+        peer.on('connection', (conn) => {
+            if (connRef.current && connRef.current.open) {
+                conn.close();
+                return;
             }
             connRef.current = conn;
             setGameMode(GameMode.PLAYING);
-            setupConnectionEvents(conn);
-            startNewGame();
+            setupConnectionEventsRef.current(conn);
+            startNewGameRef.current();
         });
+
         peer.on('error', (err: any) => {
-            setErrorMsg(`PeerJS Error: ${err.type}`);
-            setGameMode(GameMode.ERROR);
+            setErrorMsg(`Error: ${err.message || err.type}`);
+            if (gameMode === GameMode.JOINING) {
+                setGameMode(GameMode.LOBBY);
+            }
+        });
+        
+        peer.on('disconnected', () => {
+             setErrorMsg('Disconnected from the PeerJS server. Please refresh.');
         });
 
         return () => {
-            peer.destroy();
-        }
-    }, [gameMode, setupConnectionEvents]);
-
-    const startNewGame = useCallback(() => {
-        let deck = gameLogic.shuffleDeck(gameLogic.createDeck());
-        const newPlayers = JSON.parse(JSON.stringify(initialPlayers));
-
-        for (let i = 0; i < 7; i++) {
-            newPlayers[0].hand.push(deck.pop()!);
-            newPlayers[1].hand.push(deck.pop()!);
-        }
-
-        let topCard = deck.pop()!;
-        while(topCard.value === Value.WILD_DRAW_FOUR) {
-            deck.push(topCard);
-            deck = gameLogic.shuffleDeck(deck);
-            topCard = deck.pop()!;
-        }
-        
-        const initialState = {
-            ...INITIAL_STATE,
-            deck,
-            discardPile: [topCard],
-            players: newPlayers,
-            currentColor: topCard.color === Color.WILD ? Color.RED : topCard.color,
-            gameMessage: "Game started! Player 1's turn."
+            if (!peer.destroyed) {
+                peer.destroy();
+            }
         };
-        
-        setGameState(initialState);
-        setMyPlayerIndex(0);
-        sendAction({type: 'START_GAME', initialState, playerIndex: 1 });
-
-    }, [sendAction]);
+    }, []);
 
     const handleCreateGame = () => {
         setGameMode(GameMode.HOSTING);
@@ -292,8 +324,10 @@ function App() {
             return;
         }
         if (peerRef.current) {
-            const conn = peerRef.current.connect(remotePeerId);
-            setupConnectionEvents(conn);
+            setGameMode(GameMode.JOINING);
+            setErrorMsg('');
+            const conn = peerRef.current.connect(remotePeerId, { reliable: true });
+            setupConnectionEventsRef.current(conn);
         }
     };
 
@@ -302,13 +336,16 @@ function App() {
         if (card.color === Color.WILD) {
             setPendingWildCard(card);
             setColorPickerOpen(true);
+            return;
         }
         
+        const action: P2PAction = { type: 'PLAY_CARD', card };
         if (isHost) {
-            handleHostActions({ type: 'PLAY_CARD', card }, myPlayerIndex!);
+            handleHostActions(action, myPlayerIndex!);
         } else {
-            sendAction({ type: 'PLAY_CARD', card });
+            sendAction(action);
         }
+
         if (player.hand.length === 2 && !gameState.unoCalled.includes(player.id)){
             // you should call uno
         }
@@ -323,12 +360,18 @@ function App() {
     };
     
     const handleSelectColor = (color: Color) => {
+        const cardToPlay = pendingWildCard;
         setColorPickerOpen(false);
         setPendingWildCard(null);
+
+        if(!cardToPlay) return;
+
+        const action: P2PAction = { type: 'PLAY_CARD', card: cardToPlay, chosenColor: color };
+
         if (isHost) {
-            handleHostActions({ type: 'CHOOSE_COLOR', color }, myPlayerIndex!);
+            handleHostActions(action, myPlayerIndex!);
         } else {
-            sendAction({ type: 'CHOOSE_COLOR', color });
+            sendAction(action);
         }
     };
     
@@ -346,7 +389,7 @@ function App() {
     if (gameMode === GameMode.LOBBY || gameMode === GameMode.HOSTING || gameMode === GameMode.JOINING) {
         return (
             <div className="min-h-screen flex items-center justify-center bg-gray-800 text-white p-4">
-                <div className="w-full max-w-md bg-gray-900 rounded-xl shadow-2xl p-8 text-center">
+                <div className="w-full max-w-md bg-gray-900 rounded-xl shadow-2xl p-8 text-center relative">
                     <h1 className="text-4xl font-bold mb-6 text-yellow-400">UNO Multiplayer</h1>
                     {gameMode === GameMode.HOSTING ? (
                         <div>
@@ -371,6 +414,13 @@ function App() {
                         </>
                     )}
                     {errorMsg && <p className="text-red-500 mt-4">{errorMsg}</p>}
+
+                    {gameMode === GameMode.JOINING && (
+                        <div className="absolute inset-0 bg-gray-900/80 flex flex-col items-center justify-center rounded-xl">
+                            <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-yellow-400"></div>
+                            <p className="text-xl mt-4">Connecting to game...</p>
+                        </div>
+                    )}
                 </div>
             </div>
         )
@@ -386,7 +436,7 @@ function App() {
     return (
         <div className="min-h-screen bg-cover bg-center bg-fixed" style={{backgroundImage: 'url(https://picsum.photos/seed/uno-bg/1920/1080)'}}>
             <div className="min-h-screen bg-gray-900/80 backdrop-blur-sm flex flex-col items-center justify-between p-4 font-sans">
-                 {gameState.isGameOver && <GameOverScreen winner={gameState.winner} onNewGame={startNewGame} isHost={isHost} />}
+                 {gameState.isGameOver && <GameOverScreen winner={gameState.winner} onNewGame={startNewGameRef.current} isHost={isHost} />}
                  {isColorPickerOpen && <ColorPicker onSelectColor={handleSelectColor} />}
                  
                  {opponent && (
@@ -405,7 +455,7 @@ function App() {
                          <div className="flex justify-center mt-4">
                             <button onClick={handleUnoClick} 
                                 className="bg-yellow-500 text-black font-bold py-2 px-6 rounded-lg hover:bg-yellow-600 transition-colors disabled:bg-gray-600 disabled:cursor-not-allowed"
-                                disabled={me.hand.length !== 1 || gameState.unoCalled.includes(me.id)}>
+                                disabled={!me || me.hand.length !== 1 || gameState.unoCalled.includes(me.id)}>
                                 UNO
                             </button>
                         </div>

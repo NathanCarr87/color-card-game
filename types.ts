@@ -59,9 +59,8 @@ export enum GameMode {
 // P2P Communication Actions
 export type P2PAction =
   | { type: 'START_GAME'; initialState: GameState, playerIndex: number }
-  | { type: 'PLAY_CARD'; card: Card }
+  | { type: 'PLAY_CARD'; card: Card; chosenColor?: Color }
   | { type: 'DRAW_CARD' }
-  | { type: 'CHOOSE_COLOR'; color: Color }
   | { type: 'GAME_STATE_UPDATE'; gameState: GameState }
   | { type: 'CALL_UNO' }
   | { type: 'PLAYER_INFO'; name: string };
